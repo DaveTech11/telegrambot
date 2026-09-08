@@ -1,0 +1,18 @@
+{
+  "name": "telegram-broadcast-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot: scheduled text/image broadcasts to groups & channels, plus self profile-picture updates",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "node-cron": "^3.0.3",
+    "telegram": "^2.22.2"
+  }
+}
