@@ -1,20 +1,16 @@
 module.exports = {
-  // Get these from https://my.telegram.org (API development tools)
-  API_ID: 37815271,
-  API_HASH: '1EV9MEuZGVTTjnmf9hXmuY9tVMUn7SsJzH',
-
   // Get this from @BotFather
-  BOT_TOKEN: '8274768080:AAEEzl6UCl7sW-EX7jcUD0XR9JOBkYKkJ4g',
+  BOT_TOKEN: '8926829102:AAFJivM7MbkGUJf5-xDnWVtc-rlqcZMc-QI',
 
-  // Your numeric Telegram user ID(s) - only these people can run /setpic, /send, /status
+  // Automatically set this image as the bot profile picture every time the bot deploys/starts.
+  UPDATE_PIC_ON_DEPLOY: true,
+  PROFILE_PIC_URL: 'https://files.catbox.moe/dhyvzq.jpg',
+
+  // Your numeric Telegram user ID(s) - only these people can run owner commands
   OWNER_IDS: [7724436551],
 
   // Group/channel IDs the bot should post to (usually negative numbers)
   TARGET_CHATS: [-1001234567890],
-  
-  // --- Profile picture ---
-  PROFILE_PIC_PATH: './profile.jpg',
-  UPDATE_PIC_ON_DEPLOY: true,
 
   // --- Every-2-minutes recurring post ---
   RECURRING_TEXT: 'Automated update',
