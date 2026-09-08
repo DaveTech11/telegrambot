@@ -534,11 +534,49 @@ bot.on('photo', async (ctx) => {
   }
 });
 
+
+
+// ---------- Automatic bot profile picture on deploy ----------
+async function updateProfilePictureOnDeploy() {
+  const enabled = config.UPDATE_PIC_ON_DEPLOY !== false;
+  const imageUrl = config.PROFILE_PIC_URL;
+  if (!enabled || !imageUrl) return;
+
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) throw new Error(`Could not download profile picture: HTTP ${response.status}`);
+
+    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    const imageBuffer = Buffer.from(await response.arrayBuffer());
+    if (!imageBuffer.length) throw new Error('Downloaded profile picture is empty.');
+
+    const form = new FormData();
+    form.append('photo', JSON.stringify({ type: 'static', photo: 'attach://profile_photo' }));
+    form.append(
+      'profile_photo',
+      new Blob([imageBuffer], { type: contentType || 'image/jpeg' }),
+      'profile.jpg'
+    );
+
+    const apiResponse = await fetch(
+      `https://api.telegram.org/bot${config.BOT_TOKEN}/setMyProfilePhoto`,
+      { method: 'POST', body: form }
+    );
+    const result = await apiResponse.json();
+
+    if (!result.ok) throw new Error(result.description || 'Telegram API error');
+    console.log('✅ Bot profile picture updated from PROFILE_PIC_URL.');
+  } catch (error) {
+    console.error(`❌ Failed to update bot profile picture: ${error.message}`);
+  }
+}
+
 async function main() {
   setupSchedules();
   loadCustomSchedules();
   await setupCommandMenus();
   await bot.launch();
+  await updateProfilePictureOnDeploy();
   console.log('Bot started.');
 }
 
