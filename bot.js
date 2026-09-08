@@ -540,34 +540,67 @@ bot.on('photo', async (ctx) => {
 async function updateProfilePictureOnDeploy() {
   const enabled = config.UPDATE_PIC_ON_DEPLOY !== false;
   const imageUrl = config.PROFILE_PIC_URL;
-  if (!enabled || !imageUrl) return;
+  if (!enabled || !imageUrl) {
+    console.log('ℹ️ Automatic profile picture update is disabled or PROFILE_PIC_URL is missing.');
+    return;
+  }
 
   try {
-    const response = await fetch(imageUrl);
-    if (!response.ok) throw new Error(`Could not download profile picture: HTTP ${response.status}`);
+    console.log(`🖼️ Downloading bot profile picture: ${imageUrl}`);
 
-    const contentType = (response.headers.get('content-type') || '').toLowerCase();
-    const imageBuffer = Buffer.from(await response.arrayBuffer());
+    const imageResponse = await fetch(imageUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 TelegramBot/1.0' },
+      redirect: 'follow'
+    });
+
+    if (!imageResponse.ok) {
+      throw new Error(`Image download failed: HTTP ${imageResponse.status} ${imageResponse.statusText}`);
+    }
+
+    const imageBuffer = Buffer.from(await imageResponse.arrayBuffer());
     if (!imageBuffer.length) throw new Error('Downloaded profile picture is empty.');
 
+    // Telegram requires a freshly uploaded JPG for setMyProfilePhoto.
+    // The URL is downloaded first; the bytes are then uploaded as a new file.
     const form = new FormData();
-    form.append('photo', JSON.stringify({ type: 'static', photo: 'attach://profile_photo' }));
+    form.append(
+      'photo',
+      JSON.stringify({
+        type: 'static',
+        photo: 'attach://profile_photo'
+      })
+    );
     form.append(
       'profile_photo',
-      new Blob([imageBuffer], { type: contentType || 'image/jpeg' }),
+      new Blob([imageBuffer], { type: 'image/jpeg' }),
       'profile.jpg'
     );
 
-    const apiResponse = await fetch(
+    const telegramResponse = await fetch(
       `https://api.telegram.org/bot${config.BOT_TOKEN}/setMyProfilePhoto`,
-      { method: 'POST', body: form }
+      {
+        method: 'POST',
+        body: form
+      }
     );
-    const result = await apiResponse.json();
 
-    if (!result.ok) throw new Error(result.description || 'Telegram API error');
-    console.log('✅ Bot profile picture updated from PROFILE_PIC_URL.');
+    const raw = await telegramResponse.text();
+    let result;
+    try {
+      result = JSON.parse(raw);
+    } catch {
+      throw new Error(`Telegram returned non-JSON response (HTTP ${telegramResponse.status}): ${raw.slice(0, 500)}`);
+    }
+
+    if (!telegramResponse.ok || !result.ok) {
+      throw new Error(
+        `Telegram setMyProfilePhoto failed (HTTP ${telegramResponse.status}): ${result.description || raw}`
+      );
+    }
+
+    console.log('✅ Bot profile picture updated successfully on startup/deploy.');
   } catch (error) {
-    console.error(`❌ Failed to update bot profile picture: ${error.message}`);
+    console.error(`❌ Profile picture update failed: ${error.stack || error.message || error}`);
   }
 }
 
@@ -575,8 +608,12 @@ async function main() {
   setupSchedules();
   loadCustomSchedules();
   await setupCommandMenus();
-  await bot.launch();
+
+  // Do this before starting polling so deployment logs clearly show whether
+  // Telegram accepted the new profile photo.
   await updateProfilePictureOnDeploy();
+
+  await bot.launch();
   console.log('Bot started.');
 }
 
