@@ -1,10 +1,10 @@
 module.exports = {
   // Get these from https://my.telegram.org (API development tools)
-  API_ID: 123456,
-  API_HASH: 'your_api_hash_here',
+  API_ID: 37815271,
+  API_HASH: '1EV9MEuZGVTTjnmf9hXmuY9tVMUn7SsJzH',
 
   // Get this from @BotFather
-  BOT_TOKEN: '8774618870:AAFVTbqXZDH2aHWpnpPrODKfCyp-lWv3Isw',
+  BOT_TOKEN: '8274768080:AAEEzl6UCl7sW-EX7jcUD0XR9JOBkYKkJ4g',
 
   // Your numeric Telegram user ID(s) - only these people can run /setpic, /send, /status
   OWNER_IDS: [7724436551],
