@@ -4,14 +4,14 @@ module.exports = {
   API_HASH: 'your_api_hash_here',
 
   // Get this from @BotFather
-  BOT_TOKEN: '123456:your-bot-token-here',
+  BOT_TOKEN: '8774618870:AAFVTbqXZDH2aHWpnpPrODKfCyp-lWv3Isw',
 
   // Your numeric Telegram user ID(s) - only these people can run /setpic, /send, /status
-  OWNER_IDS: [111111111],
+  OWNER_IDS: [7724436551],
 
   // Group/channel IDs the bot should post to (usually negative numbers)
   TARGET_CHATS: [-1001234567890],
-
+  
   // --- Profile picture ---
   PROFILE_PIC_PATH: './profile.jpg',
   UPDATE_PIC_ON_DEPLOY: true,
