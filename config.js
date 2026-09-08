@@ -1,6 +1,6 @@
 module.exports = {
   // Get this from @BotFather
-  BOT_TOKEN: '8926829102:AAFJivM7MbkGUJf5-xDnWVtc-rlqcZMc-QI',
+  BOT_TOKEN: '8744331266:AAFq_bneO3TNKkF7ugbPntj7wIpSsUST8xY',
 
   // Automatically set this image as the bot profile picture every time the bot deploys/starts.
   UPDATE_PIC_ON_DEPLOY: true,
