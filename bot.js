@@ -216,6 +216,8 @@ bot.action('adm_setpic_help', async (ctx) => {
 
 // Owner-only: change the bot's own Telegram profile picture using the Bot API.
 // Usage: send a photo, then reply to that photo with /setpic.
+// Telegram requires the profile photo to be uploaded as a file, so we download
+// the replied Telegram photo and upload it as multipart/form-data.
 bot.command('setpic', async (ctx) => {
   if (!isOwner(ctx)) return;
 
@@ -224,21 +226,31 @@ bot.command('setpic', async (ctx) => {
     return ctx.reply('🖼️ Reply to a photo with /setpic to change my profile picture.');
   }
 
-  const fileId = replied.photo[replied.photo.length - 1].file_id;
-
   try {
-    await bot.telegram.callApi('setMyProfilePhoto', {
-      photo: JSON.stringify({
-        type: 'static',
-        photo: fileId
-      })
+    const largest = replied.photo[replied.photo.length - 1];
+    const fileLink = await ctx.telegram.getFileLink(largest.file_id);
+    const photoResponse = await fetch(fileLink.href);
+    if (!photoResponse.ok) throw new Error(`Could not download photo: HTTP ${photoResponse.status}`);
+
+    const photoBuffer = Buffer.from(await photoResponse.arrayBuffer());
+    const form = new FormData();
+    const photoBlob = new Blob([photoBuffer], { type: 'image/jpeg' });
+
+    form.append('photo', JSON.stringify({ type: 'static', photo: 'attach://profile_photo' }));
+    form.append('profile_photo', photoBlob, 'profile.jpg');
+
+    const apiResponse = await fetch(`https://api.telegram.org/bot${config.BOT_TOKEN}/setMyProfilePhoto`, {
+      method: 'POST',
+      body: form
     });
+    const result = await apiResponse.json();
+
+    if (!result.ok) throw new Error(result.description || 'Telegram API error');
 
     await ctx.reply('✅ Bot profile picture updated successfully.');
   } catch (error) {
     console.error('setpic error:', error);
-    await ctx.reply(`❌ Failed to update profile picture.
-${error.description || error.message || 'Telegram API error'}`);
+    await ctx.reply(`❌ Failed to update profile picture.\n${error.description || error.message || 'Telegram API error'}`);
   }
 });
 
