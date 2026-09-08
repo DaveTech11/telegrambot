@@ -1,125 +1,4 @@
 
-/* ============================================================
-   V3 IMAGE AUTO-BROADCAST
-   Owner-controlled, scheduled image delivery to groups.
-   Stores one uploaded image locally and sends it to groups
-   at a configurable interval. Includes stop/status controls.
-   ============================================================ */
-const IMAGE_AUTO_BROADCAST = {
-  dataDir: path.join(__dirname, 'data'),
-  filePath: path.join(__dirname, 'data', 'auto-broadcast-image.json'),
-  mediaDir: path.join(__dirname, 'data', 'media'),
-  state: { enabled: false, intervalMs: 30 * 60 * 1000, caption: '' }
-};
-
-function ensureImageAutoBroadcastStorage() {
-  fs.mkdirSync(IMAGE_AUTO_BROADCAST.dataDir, { recursive: true });
-  fs.mkdirSync(IMAGE_AUTO_BROADCAST.mediaDir, { recursive: true });
-  try {
-    if (fs.existsSync(IMAGE_AUTO_BROADCAST.filePath)) {
-      const saved = JSON.parse(fs.readFileSync(IMAGE_AUTO_BROADCAST.filePath, 'utf8'));
-      IMAGE_AUTO_BROADCAST.state = {
-        ...IMAGE_AUTO_BROADCAST.state,
-        ...saved
-      };
-    }
-  } catch (_) {}
-}
-
-function saveImageAutoBroadcastState() {
-  ensureImageAutoBroadcastStorage();
-  fs.writeFileSync(
-    IMAGE_AUTO_BROADCAST.filePath,
-    JSON.stringify(IMAGE_AUTO_BROADCAST.state, null, 2)
-  );
-}
-
-function getSavedAutoBroadcastImage() {
-  const p = IMAGE_AUTO_BROADCAST.state.imagePath;
-  return p && fs.existsSync(p) ? p : null;
-}
-
-function parseBroadcastInterval(value) {
-  const m = String(value || '').trim().match(/^(\d+)\s*(s|m|h)$/i);
-  if (!m) return null;
-  const n = Number(m[1]);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  const unit = m[2].toLowerCase();
-  return n * (unit === 's' ? 1000 : unit === 'm' ? 60000 : 3600000);
-}
-
-function formatBroadcastInterval(ms) {
-  if (ms % 3600000 === 0) return `${ms / 3600000}h`;
-  if (ms % 60000 === 0) return `${ms / 60000}m`;
-  return `${Math.round(ms / 1000)}s`;
-}
-
-function isGroupChatId(chatId) {
-  return typeof chatId === 'string' && chatId.endsWith('@g.us');
-}
-
-async function getBotGroupChats(botApi) {
-  // Uses Telegram's getUpdates/chat history only when the bot has
-  // seen group chats; this keeps the feature compatible with the
-  // existing Telegram bot architecture.
-  const seen = new Set(IMAGE_AUTO_BROADCAST.state.groupChats || []);
-  if (Array.isArray(IMAGE_AUTO_BROADCAST.state.groupChats)) {
-    return [...seen].filter(isGroupChatId);
-  }
-  return [];
-}
-
-async function sendSavedImageToGroups(botApi) {
-  const imagePath = getSavedAutoBroadcastImage();
-  if (!imagePath) return { sent: 0, failed: 0, skipped: 0, reason: 'no-image' };
-
-  const groups = await getBotGroupChats(botApi);
-  let sent = 0, failed = 0, skipped = 0;
-
-  for (const chatId of groups) {
-    try {
-      await botApi.sendPhoto(chatId, imagePath, {
-        caption: IMAGE_AUTO_BROADCAST.state.caption || undefined
-      });
-      sent++;
-    } catch (_) {
-      failed++;
-    }
-    // Deliberate pacing: prevents a tight loop from flooding the API.
-    await new Promise(resolve => setTimeout(resolve, 1500));
-  }
-
-  return { sent, failed, skipped };
-}
-
-function stopImageAutoBroadcast() {
-  if (IMAGE_AUTO_BROADCAST.timer) {
-    clearInterval(IMAGE_AUTO_BROADCAST.timer);
-    IMAGE_AUTO_BROADCAST.timer = null;
-  }
-  IMAGE_AUTO_BROADCAST.state.enabled = false;
-  saveImageAutoBroadcastState();
-}
-
-function startImageAutoBroadcast(botApi) {
-  stopImageAutoBroadcast();
-  if (!getSavedAutoBroadcastImage()) return false;
-  IMAGE_AUTO_BROADCAST.state.enabled = true;
-  saveImageAutoBroadcastState();
-
-  // Run once immediately, then on the configured interval.
-  sendSavedImageToGroups(botApi).catch(() => {});
-  IMAGE_AUTO_BROADCAST.timer = setInterval(() => {
-    sendSavedImageToGroups(botApi).catch(() => {});
-  }, IMAGE_AUTO_BROADCAST.state.intervalMs);
-  return true;
-}
-
-ensureImageAutoBroadcastStorage();
-/* ============================================================
-   END V3 IMAGE AUTO-BROADCAST
-   ============================================================ */
-
 const { Telegraf, Markup } = require('telegraf');
 const cron = require('node-cron');
 const fs = require('fs');
@@ -510,6 +389,159 @@ async function setupCommandMenus() {
   );
 }
 
+/* ============================================================
+   V3 TELEGRAM IMAGE AUTO-BROADCAST
+   Owner-controlled scheduled image delivery to tracked groups.
+   Telegram Bot API does not provide a list-all-groups endpoint, so
+   groups are tracked whenever the bot receives a group message.
+   ============================================================ */
+const IMAGE_AUTO_BROADCAST = {
+  dataDir: path.join(__dirname, 'data'),
+  filePath: path.join(__dirname, 'data', 'auto-broadcast-image.json'),
+  mediaDir: path.join(__dirname, 'data', 'media'),
+  state: { enabled: false, intervalMs: 30 * 60 * 1000, caption: '', groupChats: [] },
+  timer: null
+};
+
+function ensureImageAutoBroadcastStorage() {
+  fs.mkdirSync(IMAGE_AUTO_BROADCAST.dataDir, { recursive: true });
+  fs.mkdirSync(IMAGE_AUTO_BROADCAST.mediaDir, { recursive: true });
+  try {
+    if (fs.existsSync(IMAGE_AUTO_BROADCAST.filePath)) {
+      const saved = JSON.parse(fs.readFileSync(IMAGE_AUTO_BROADCAST.filePath, 'utf8'));
+      IMAGE_AUTO_BROADCAST.state = { ...IMAGE_AUTO_BROADCAST.state, ...saved };
+    }
+  } catch (_) {}
+}
+function saveImageAutoBroadcastState() {
+  ensureImageAutoBroadcastStorage();
+  fs.writeFileSync(IMAGE_AUTO_BROADCAST.filePath, JSON.stringify(IMAGE_AUTO_BROADCAST.state, null, 2));
+}
+function getSavedAutoBroadcastImage() {
+  const p = IMAGE_AUTO_BROADCAST.state.imagePath;
+  return p && fs.existsSync(p) ? p : null;
+}
+function parseBroadcastInterval(value) {
+  const m = String(value || '').trim().match(/^(\d+)\s*(s|m|h)$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = m[2].toLowerCase();
+  return n > 0 ? n * (unit === 's' ? 1000 : unit === 'm' ? 60000 : 3600000) : null;
+}
+function formatBroadcastInterval(ms) {
+  if (ms % 3600000 === 0) return `${ms / 3600000}h`;
+  if (ms % 60000 === 0) return `${ms / 60000}m`;
+  return `${Math.round(ms / 1000)}s`;
+}
+async function sendSavedImageToGroups() {
+  const imagePath = getSavedAutoBroadcastImage();
+  if (!imagePath) return { sent: 0, failed: 0, reason: 'no-image' };
+  const groups = [...new Set(IMAGE_AUTO_BROADCAST.state.groupChats || [])];
+  let sent = 0, failed = 0;
+  for (const chatId of groups) {
+    try {
+      await bot.telegram.sendPhoto(chatId, { source: imagePath }, {
+        caption: IMAGE_AUTO_BROADCAST.state.caption || undefined
+      });
+      sent++;
+    } catch (e) {
+      failed++;
+      console.error(`Image broadcast failed for ${chatId}: ${e.message}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+  return { sent, failed };
+}
+function stopImageAutoBroadcast() {
+  if (IMAGE_AUTO_BROADCAST.timer) clearInterval(IMAGE_AUTO_BROADCAST.timer);
+  IMAGE_AUTO_BROADCAST.timer = null;
+  IMAGE_AUTO_BROADCAST.state.enabled = false;
+  saveImageAutoBroadcastState();
+}
+function startImageAutoBroadcast() {
+  stopImageAutoBroadcast();
+  if (!getSavedAutoBroadcastImage()) return false;
+  IMAGE_AUTO_BROADCAST.state.enabled = true;
+  saveImageAutoBroadcastState();
+  sendSavedImageToGroups().catch(console.error);
+  IMAGE_AUTO_BROADCAST.timer = setInterval(() => sendSavedImageToGroups().catch(console.error), IMAGE_AUTO_BROADCAST.state.intervalMs);
+  return true;
+}
+ensureImageAutoBroadcastStorage();
+
+bot.use(async (ctx, next) => {
+  try {
+    const type = ctx.chat?.type;
+    if ((type === 'group' || type === 'supergroup') && ctx.chat?.id) {
+      const groups = new Set(IMAGE_AUTO_BROADCAST.state.groupChats || []);
+      groups.add(String(ctx.chat.id));
+      IMAGE_AUTO_BROADCAST.state.groupChats = [...groups];
+      saveImageAutoBroadcastState();
+    }
+  } catch (_) {}
+  return next();
+});
+
+bot.command('autostatus', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const img = getSavedAutoBroadcastImage();
+  await ctx.reply(`🖼️ Image auto-broadcast\nImage: ${img ? 'saved' : 'not set'}\nGroups tracked: ${(IMAGE_AUTO_BROADCAST.state.groupChats || []).length}\nStatus: ${IMAGE_AUTO_BROADCAST.state.enabled ? 'ON' : 'OFF'}\nInterval: ${formatBroadcastInterval(IMAGE_AUTO_BROADCAST.state.intervalMs)}`);
+});
+bot.command('sendimage', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const result = await sendSavedImageToGroups();
+  await ctx.reply(result.reason === 'no-image' ? '❌ No image is saved. Send a photo to the bot first.' : `🖼️ Broadcast complete\n✅ Sent: ${result.sent}\n❌ Failed: ${result.failed}`);
+});
+bot.command('autosend', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const text = ctx.message.text.trim();
+  if (/^\/autosend\s+off$/i.test(text)) {
+    stopImageAutoBroadcast();
+    return ctx.reply('🛑 Image auto-broadcast stopped.');
+  }
+  const match = text.match(/^\/autosend\s+on(?:\s+(\d+\s*[smh]))?$/i);
+  if (!match) return ctx.reply('Usage: /autosend on 1h  |  /autosend off');
+  if (match[1]) IMAGE_AUTO_BROADCAST.state.intervalMs = parseBroadcastInterval(match[1]) || IMAGE_AUTO_BROADCAST.state.intervalMs;
+  const ok = startImageAutoBroadcast();
+  await ctx.reply(ok ? `✅ Image auto-broadcast enabled every ${formatBroadcastInterval(IMAGE_AUTO_BROADCAST.state.intervalMs)}.` : '❌ Save an image first by sending a photo to the bot.');
+});
+bot.command('autointerval', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const match = ctx.message.text.match(/^\/autointerval\s+(\d+\s*[smh])$/i);
+  const parsed = match && parseBroadcastInterval(match[1]);
+  if (!parsed) return ctx.reply('❌ Use a value such as 30s, 10m, or 1h.');
+  IMAGE_AUTO_BROADCAST.state.intervalMs = parsed;
+  saveImageAutoBroadcastState();
+  if (IMAGE_AUTO_BROADCAST.state.enabled) startImageAutoBroadcast();
+  await ctx.reply(`✅ Interval set to ${formatBroadcastInterval(parsed)}.`);
+});
+bot.command('autocaption', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  IMAGE_AUTO_BROADCAST.state.caption = ctx.message.text.replace(/^\/autocaption\s*/i, '');
+  saveImageAutoBroadcastState();
+  await ctx.reply('✅ Auto-broadcast caption updated.');
+});
+bot.on('photo', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  try {
+    ensureImageAutoBroadcastStorage();
+    const largest = ctx.message.photo[ctx.message.photo.length - 1];
+    const link = await ctx.telegram.getFileLink(largest.file_id);
+    const res = await fetch(link.href);
+    if (!res.ok) throw new Error(`download failed: ${res.status}`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const filePath = path.join(IMAGE_AUTO_BROADCAST.mediaDir, `${Date.now()}.jpg`);
+    fs.writeFileSync(filePath, buffer);
+    IMAGE_AUTO_BROADCAST.state.imagePath = filePath;
+    IMAGE_AUTO_BROADCAST.state.savedAt = new Date().toISOString();
+    saveImageAutoBroadcastState();
+    await ctx.reply('✅ Image saved. Use /sendimage for a one-time broadcast or /autosend on 1h for scheduled sending.');
+  } catch (e) {
+    console.error('Could not save broadcast image:', e);
+    await ctx.reply('❌ Could not save the image.');
+  }
+});
+
 async function main() {
   await initGramClient();
   if (config.UPDATE_PIC_ON_DEPLOY) {
@@ -528,116 +560,3 @@ process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
 
-/* V3 command handlers: image storage + controlled group scheduler */
-function v3OwnerOnly(msg) {
-  const owner = String(process.env.OWNER_ID || process.env.OWNER || '').trim();
-  return owner && String(msg.from?.id || '') === owner;
-}
-
-function v3RememberGroup(msg) {
-  const chatId = msg.chat?.id;
-  if (isGroupChatId(String(chatId))) {
-    const groups = new Set(IMAGE_AUTO_BROADCAST.state.groupChats || []);
-    groups.add(String(chatId));
-    IMAGE_AUTO_BROADCAST.state.groupChats = [...groups];
-    saveImageAutoBroadcastState();
-  }
-}
-
-if (typeof bot !== 'undefined' && bot && typeof bot.on === 'function') {
-  bot.on('message', async (msg) => {
-    try {
-      v3RememberGroup(msg);
-      if (!msg.text || !v3OwnerOnly(msg)) return;
-
-      const text = msg.text.trim();
-
-      if (text === '/autostatus') {
-        const img = getSavedAutoBroadcastImage();
-        await bot.sendMessage(msg.chat.id,
-          `🖼️ Image auto-broadcast\n` +
-          `Image: ${img ? 'saved' : 'not set'}\n` +
-          `Groups tracked: ${(IMAGE_AUTO_BROADCAST.state.groupChats || []).length}\n` +
-          `Status: ${IMAGE_AUTO_BROADCAST.state.enabled ? 'ON' : 'OFF'}\n` +
-          `Interval: ${formatBroadcastInterval(IMAGE_AUTO_BROADCAST.state.intervalMs)}`
-        );
-        return;
-      }
-
-      if (text === '/sendimage') {
-        const result = await sendSavedImageToGroups(bot);
-        await bot.sendMessage(msg.chat.id,
-          result.reason === 'no-image'
-            ? '❌ No image is saved. Send a photo to the bot first.'
-            : `🖼️ Broadcast complete\\n✅ Sent: ${result.sent}\\n❌ Failed: ${result.failed}`
-        );
-        return;
-      }
-
-      if (text === '/autosend off') {
-        stopImageAutoBroadcast();
-        await bot.sendMessage(msg.chat.id, '🛑 Image auto-broadcast stopped.');
-        return;
-      }
-
-      const onMatch = text.match(/^\/autosend\s+on(?:\s+(\d+\s*[smh]))?$/i);
-      if (onMatch) {
-        const parsed = onMatch[1] ? parseBroadcastInterval(onMatch[1]) : IMAGE_AUTO_BROADCAST.state.intervalMs;
-        if (parsed) IMAGE_AUTO_BROADCAST.state.intervalMs = parsed;
-        const ok = startImageAutoBroadcast(bot);
-        await bot.sendMessage(msg.chat.id,
-          ok
-            ? `✅ Image auto-broadcast enabled every ${formatBroadcastInterval(IMAGE_AUTO_BROADCAST.state.intervalMs)}.`
-            : '❌ Save an image first by sending a photo to the bot.'
-        );
-        return;
-      }
-
-      const capMatch = text.match(/^\/autocaption(?:\s+([\s\S]*))?$/i);
-      if (capMatch) {
-        IMAGE_AUTO_BROADCAST.state.caption = capMatch[1] || '';
-        saveImageAutoBroadcastState();
-        await bot.sendMessage(msg.chat.id, '✅ Auto-broadcast caption updated.');
-        return;
-      }
-
-      const intervalMatch = text.match(/^\/autointerval\s+(\d+\s*[smh])$/i);
-      if (intervalMatch) {
-        const parsed = parseBroadcastInterval(intervalMatch[1]);
-        if (!parsed) {
-          await bot.sendMessage(msg.chat.id, '❌ Use a value such as 30s, 10m, or 1h.');
-          return;
-        }
-        IMAGE_AUTO_BROADCAST.state.intervalMs = parsed;
-        saveImageAutoBroadcastState();
-        await bot.sendMessage(msg.chat.id, `✅ Interval set to ${formatBroadcastInterval(parsed)}.`);
-        return;
-      }
-    } catch (_) {}
-  });
-
-  // Capture owner photos and save the newest one.
-  bot.on('photo', async (msg) => {
-    try {
-      if (!v3OwnerOnly(msg) || !msg.photo?.length) return;
-      ensureImageAutoBroadcastStorage();
-
-      const largest = msg.photo[msg.photo.length - 1];
-      if (typeof bot.downloadFile !== 'function') return;
-
-      const filePath = await bot.downloadFile(
-        largest.file_id,
-        IMAGE_AUTO_BROADCAST.mediaDir
-      );
-
-      IMAGE_AUTO_BROADCAST.state.imagePath = filePath;
-      IMAGE_AUTO_BROADCAST.state.savedAt = new Date().toISOString();
-      saveImageAutoBroadcastState();
-
-      await bot.sendMessage(
-        msg.chat.id,
-        '✅ Image saved. Use /sendimage for a one-time broadcast or /autosend on 1h for scheduled sending.'
-      );
-    } catch (_) {}
-  });
-}
