@@ -6,6 +6,20 @@ const path = require('path');
 
 const config = require('./config');
 
+// ---------- Render Web Service health server ----------
+const http = require('http');
+const PORT = Number(process.env.PORT) || 10000;
+
+const healthServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Xryon Telegram bot is running');
+});
+
+healthServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 Health server listening on 0.0.0.0:${PORT}`);
+});
+
+
 const bot = new Telegraf(config.BOT_TOKEN);
 
 // ---------- Bot identity from BOT_TOKEN ----------
@@ -125,8 +139,92 @@ async function isBotAdmin(chatId) {
   }
 }
 
+
+// ---------- Owner-selected broadcast targets ----------
+const BROADCAST_TARGETS_FILE = path.join(__dirname, 'data', 'broadcast-targets.json');
+
+function ensureBroadcastTargetStorage() {
+  fs.mkdirSync(path.dirname(BROADCAST_TARGETS_FILE), { recursive: true });
+  if (!fs.existsSync(BROADCAST_TARGETS_FILE)) {
+    fs.writeFileSync(BROADCAST_TARGETS_FILE, JSON.stringify([], null, 2));
+  }
+}
+
+function loadBroadcastTargets() {
+  ensureBroadcastTargetStorage();
+  try {
+    const list = JSON.parse(fs.readFileSync(BROADCAST_TARGETS_FILE, 'utf8'));
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveBroadcastTargets(list) {
+  ensureBroadcastTargetStorage();
+  fs.writeFileSync(BROADCAST_TARGETS_FILE, JSON.stringify(list, null, 2));
+}
+
+function targetIsSelected(chatId) {
+  return loadBroadcastTargets().some(x => String(x.id) === String(chatId));
+}
+
+function selectedTargetIds() {
+  return loadBroadcastTargets().map(x => String(x.id));
+}
+
+function addBroadcastTarget(chat) {
+  const list = loadBroadcastTargets();
+  if (!list.some(x => String(x.id) === String(chat.id))) {
+    list.push({
+      id: String(chat.id),
+      title: chat.title || chat.username || String(chat.id),
+      username: chat.username || '',
+      type: chat.type || ''
+    });
+    saveBroadcastTargets(list);
+  }
+}
+
+function removeBroadcastTarget(chatId) {
+  saveBroadcastTargets(loadBroadcastTargets().filter(x => String(x.id) !== String(chatId)));
+}
+
+async function getAdminChannelsAndGroups() {
+  const configured = [...new Set([
+    ...(config.TARGET_CHATS || []).map(String),
+    ...loadBroadcastTargets().map(x => String(x.id))
+  ])];
+
+  // Telegram Bot API does not provide a general "list every channel I'm admin in"
+  // endpoint. We can reliably verify known chats that have been configured/seen.
+  const results = [];
+
+  for (const chatId of configured) {
+    try {
+      const chat = await bot.telegram.getChat(chatId);
+      const me = await bot.telegram.getMe();
+      const member = await bot.telegram.getChatMember(chat.id, me.id);
+      const isAdmin = member.status === 'administrator' || member.status === 'creator';
+      if (isAdmin && (chat.type === 'channel' || chat.type === 'group' || chat.type === 'supergroup')) {
+        results.push({
+          id: String(chat.id),
+          title: chat.title || chat.username || String(chat.id),
+          username: chat.username || '',
+          type: chat.type,
+          selected: targetIsSelected(chat.id)
+        });
+      }
+    } catch (e) {
+      console.warn(`Could not inspect broadcast target ${chatId}: ${e.message}`);
+    }
+  }
+
+  return results;
+}
+
 async function broadcast({ text, imagePath, targets } = {}) {
-  const chats = targets || config.TARGET_CHATS;
+  const chats = targets || selectedTargetIds();
   for (const chat of chats) {
     const admin = await isBotAdmin(chat);
     if (!admin) {
@@ -195,6 +293,7 @@ const adminKeyboard = Markup.inlineKeyboard([
   [Markup.button.callback('🖼 Set picture (how)', 'adm_setpic_help')],
   [Markup.button.callback('⏰ Schedule a post (how)', 'adm_schedule_help')],
   [Markup.button.callback('🗑 Remove a schedule (how)', 'adm_unschedule_help')],
+  [Markup.button.callback('📡 Select broadcast channels', 'adm_broadcast_channels')],
 ]);
 
 bot.command('admin', async (ctx) => {
@@ -238,7 +337,7 @@ bot.action('adm_schedules', async (ctx) => {
 bot.action('adm_send_help', async (ctx) => {
   if (!isOwner(ctx)) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
-  await ctx.reply('Type: /send <message>\nBroadcasts it immediately to every admin chat.');
+  await ctx.reply('Type: /send <message>\nSends it to your selected broadcast channels/groups. Use /channels to select them.');
 });
 
 bot.action('adm_setpic_help', async (ctx) => {
@@ -298,6 +397,367 @@ bot.action('adm_unschedule_help', async (ctx) => {
   if (!isOwner(ctx)) return ctx.answerCbQuery();
   await ctx.answerCbQuery();
   await ctx.reply('Type: /unschedule <id>\nGet ids from the "List Schedules" button.');
+});
+
+
+
+// ---------- XRYON Broadcast Composer ----------
+const BROADCAST_HISTORY_FILE = path.join(__dirname, 'data', 'broadcast-history.json');
+const BROADCAST_DRAFT = new Map(); // ownerId -> draft
+const BROADCAST_PREVIEWS = new Map(); // ownerId -> preview data
+
+function ensureHistoryStorage() {
+  fs.mkdirSync(path.dirname(BROADCAST_HISTORY_FILE), { recursive: true });
+  if (!fs.existsSync(BROADCAST_HISTORY_FILE)) {
+    fs.writeFileSync(BROADCAST_HISTORY_FILE, JSON.stringify([], null, 2));
+  }
+}
+
+function loadBroadcastHistory() {
+  ensureHistoryStorage();
+  try {
+    const value = JSON.parse(fs.readFileSync(BROADCAST_HISTORY_FILE, 'utf8'));
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveBroadcastHistory(list) {
+  ensureHistoryStorage();
+  fs.writeFileSync(BROADCAST_HISTORY_FILE, JSON.stringify(list, null, 2));
+}
+
+function recordBroadcast(entry) {
+  const list = loadBroadcastHistory();
+  list.unshift({
+    id: Date.now().toString(36),
+    createdAt: new Date().toISOString(),
+    ...entry
+  });
+  saveBroadcastHistory(list.slice(0, 100));
+}
+
+function getDraft(ownerId) {
+  return BROADCAST_DRAFT.get(String(ownerId)) || {
+    text: '',
+    imagePath: null,
+    imageName: null,
+    mode: 'send'
+  };
+}
+
+function setDraft(ownerId, patch) {
+  const current = getDraft(ownerId);
+  const next = { ...current, ...patch };
+  BROADCAST_DRAFT.set(String(ownerId), next);
+  return next;
+}
+
+function clearDraft(ownerId) {
+  BROADCAST_DRAFT.delete(String(ownerId));
+  BROADCAST_PREVIEWS.delete(String(ownerId));
+}
+
+function broadcastComposerKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🖼 Add image', 'bc_add_image')],
+    [Markup.button.callback('✏️ Set text', 'bc_set_text')],
+    [Markup.button.callback('👀 Preview', 'bc_preview')],
+    [Markup.button.callback('📡 Destinations', 'bc_open_destinations')],
+    [Markup.button.callback('📤 Send now', 'bc_send')],
+    [Markup.button.callback('⏰ Schedule', 'bc_schedule')],
+    [Markup.button.callback('🗑 Clear', 'bc_clear')]
+  ]);
+}
+
+function formatComposerText(ownerId) {
+  const d = getDraft(ownerId);
+  const destinations = loadBroadcastTargets();
+  return [
+    '<b>💎 XRYON BROADCAST COMPOSER</b>',
+    '',
+    `<b>Destinations:</b> ${destinations.length}`,
+    `<b>Image:</b> ${d.imagePath ? escapeHtml(d.imageName || 'saved image') : 'none'}`,
+    `<b>Text:</b> ${d.text ? 'set' : 'none'}`,
+    '',
+    d.text ? `<blockquote>${escapeHtml(d.text)}</blockquote>` : 'No caption/message set yet.',
+    '',
+    'Choose an action below.'
+  ].join('\n');
+}
+
+async function showComposer(ctx) {
+  if (!isOwner(ctx)) return;
+  await ctx.reply(formatComposerText(ctx.from.id), {
+    parse_mode: 'HTML',
+    ...broadcastComposerKeyboard()
+  });
+}
+
+async function sendComposerNow(ctx) {
+  const ownerId = ctx.from.id;
+  const d = getDraft(ownerId);
+  const targets = selectedTargetIds();
+
+  if (!targets.length) return ctx.reply('❌ No destinations selected. Open Destinations first.');
+  if (!d.text && !d.imagePath) return ctx.reply('❌ Add a message or image first.');
+
+  let sent = 0, failed = 0, failures = [];
+
+  for (const chatId of targets) {
+    try {
+      const ok = await isBotAdmin(chatId);
+      if (!ok) throw new Error('Bot is not admin in this destination.');
+
+      if (d.imagePath) {
+        await sendPhotoWithRetry(chatId, d.imagePath, d.text || '');
+      } else {
+        await bot.telegram.sendMessage(chatId, d.text);
+      }
+      sent++;
+    } catch (e) {
+      failed++;
+      failures.push(`${chatId}: ${e.message}`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+
+  recordBroadcast({
+    mode: 'manual',
+    ownerId: String(ownerId),
+    targets,
+    sent,
+    failed,
+    hasImage: !!d.imagePath,
+    text: d.text || '',
+    failures
+  });
+
+  clearDraft(ownerId);
+
+  let report = `<b>📊 BROADCAST COMPLETE</b>\n\n✅ Sent: ${sent}\n❌ Failed: ${failed}`;
+  if (failures.length) {
+    report += '\n\n<b>Failures</b>\n' + failures.slice(0, 10).map(escapeHtml).join('\n');
+  }
+  await ctx.reply(report, { parse_mode: 'HTML' });
+}
+
+bot.command('broadcast', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  setDraft(ctx.from.id, { text: ctx.message.text.replace(/^\/broadcast\s*/i, '').trim() });
+  await showComposer(ctx);
+});
+
+bot.command('compose', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await showComposer(ctx);
+});
+
+bot.action('bc_open_destinations', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await showBroadcastSelector(ctx);
+});
+
+bot.action('bc_add_image', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await ctx.reply('🖼️ Send a photo now. I will attach it to the Xryon broadcast draft.');
+  BROADCAST_PREVIEWS.set(String(ctx.from.id), { waitingForImage: true });
+});
+
+bot.action('bc_set_text', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  BROADCAST_PREVIEWS.set(String(ctx.from.id), { waitingForText: true });
+  await ctx.reply('✏️ Send the caption/message for this broadcast.');
+});
+
+bot.action('bc_preview', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const d = getDraft(ctx.from.id);
+  if (!d.text && !d.imagePath) return ctx.reply('❌ Your draft is empty.');
+  const targets = loadBroadcastTargets();
+  await ctx.reply(
+    [
+      '<b>👀 BROADCAST PREVIEW</b>',
+      '',
+      `<b>Destinations:</b> ${targets.length}`,
+      `<b>Image:</b> ${d.imagePath ? 'yes' : 'no'}`,
+      '',
+      d.text ? `<blockquote>${escapeHtml(d.text)}</blockquote>` : 'No text/caption.'
+    ].join('\n'),
+    { parse_mode: 'HTML' }
+  );
+  if (d.imagePath && fs.existsSync(d.imagePath)) {
+    await ctx.replyWithPhoto({ source: d.imagePath }, { caption: d.text || undefined });
+  }
+});
+
+bot.action('bc_send', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await sendComposerNow(ctx);
+});
+
+bot.action('bc_schedule', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await ctx.reply('⏰ Scheduling from the composer: use /schedule HH:MM <message> (reply to a photo to attach it).');
+});
+
+bot.action('bc_clear', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  clearDraft(ctx.from.id);
+  await ctx.answerCbQuery('Draft cleared');
+  await ctx.reply('🗑️ Broadcast draft cleared.');
+});
+
+// Capture owner text/photo for the composer only when they explicitly entered composer mode.
+bot.on('photo', async (ctx, next) => {
+  if (!isOwner(ctx)) return next();
+  const state = BROADCAST_PREVIEWS.get(String(ctx.from.id));
+  if (!state?.waitingForImage) return next();
+
+  try {
+    ensureImageAutoBroadcastStorage();
+    const largest = ctx.message.photo[ctx.message.photo.length - 1];
+    const link = await ctx.telegram.getFileLink(largest.file_id);
+    const res = await fetch(link.href);
+    if (!res.ok) throw new Error(`download failed: ${res.status}`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const filePath = path.join(IMAGE_AUTO_BROADCAST.mediaDir, `composer-${Date.now()}.jpg`);
+    fs.writeFileSync(filePath, buffer);
+    setDraft(ctx.from.id, { imagePath: filePath, imageName: 'composer-image.jpg' });
+    BROADCAST_PREVIEWS.delete(String(ctx.from.id));
+    await ctx.reply(formatComposerText(ctx.from.id), { parse_mode: 'HTML', ...broadcastComposerKeyboard() });
+  } catch (e) {
+    console.error('Composer image error:', e);
+    await ctx.reply('❌ Could not attach that image.');
+  }
+});
+
+bot.on('text', async (ctx, next) => {
+  if (!isOwner(ctx)) return next();
+  const state = BROADCAST_PREVIEWS.get(String(ctx.from.id));
+  if (!state?.waitingForText) return next();
+
+  setDraft(ctx.from.id, { text: ctx.message.text });
+  BROADCAST_PREVIEWS.delete(String(ctx.from.id));
+  await ctx.reply(formatComposerText(ctx.from.id), { parse_mode: 'HTML', ...broadcastComposerKeyboard() });
+});
+
+bot.command('broadcasts', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const list = loadBroadcastHistory();
+  if (!list.length) return ctx.reply('📊 No broadcast history yet.');
+  const lines = list.slice(0, 10).map((x, i) =>
+    `${i + 1}. ${x.createdAt}\n✅ ${x.sent}  ❌ ${x.failed}  📡 ${x.targets.length}`
+  );
+  await ctx.reply('<b>📊 RECENT BROADCASTS</b>\n\n' + lines.join('\n\n'), { parse_mode: 'HTML' });
+});
+
+// ---------- Channel/group selector for owner broadcasts ----------
+const broadcastSelectorKeyboard = async () => {
+  const chats = await getAdminChannelsAndGroups();
+  const rows = chats.map(chat => [
+    Markup.button.callback(
+      `${chat.selected ? '✅' : '☐'} ${chat.title}`,
+      `bc_toggle:${chat.id}`
+    )
+  ]);
+  rows.push([Markup.button.callback('🔄 Refresh', 'bc_refresh')]);
+  rows.push([Markup.button.callback('✅ Done', 'bc_done')]);
+  return Markup.inlineKeyboard(rows);
+};
+
+async function showBroadcastSelector(ctx, edit = false) {
+  const chats = await getAdminChannelsAndGroups();
+  const selected = loadBroadcastTargets();
+  const selectedIds = new Set(selected.map(x => String(x.id)));
+
+  const lines = [
+    '<b>📡 Broadcast destinations</b>',
+    '',
+    'Select the channels/groups where the bot is an admin.',
+    'Only selected destinations receive /send and /sendimage.',
+    '',
+    `Selected: <b>${selected.length}</b>`
+  ];
+
+  if (selected.length) {
+    lines.push('', ...selected.map((x, i) => `${i + 1}. ${escapeHtml(x.title)} <code>${escapeHtml(x.id)}</code>`));
+  }
+
+  const keyboard = await broadcastSelectorKeyboard();
+  if (edit && ctx.callbackQuery?.message) {
+    await ctx.editMessageText(lines.join('\n'), { parse_mode: 'HTML', ...keyboard });
+  } else {
+    await ctx.reply(lines.join('\n'), { parse_mode: 'HTML', ...keyboard });
+  }
+}
+
+bot.command('channels', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await showBroadcastSelector(ctx);
+});
+
+bot.command('selectchannels', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await showBroadcastSelector(ctx);
+});
+
+bot.action('bc_refresh', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery('Refreshing...');
+  await showBroadcastSelector(ctx, true);
+});
+
+bot.action(/^bc_toggle:(.+)$/, async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+
+  const chatId = ctx.match[1];
+  const list = loadBroadcastTargets();
+  const existing = list.find(x => String(x.id) === String(chatId));
+
+  if (existing) {
+    removeBroadcastTarget(chatId);
+    await ctx.answerCbQuery('Removed from broadcast list');
+  } else {
+    try {
+      const chat = await ctx.telegram.getChat(chatId);
+      const me = await ctx.telegram.getMe();
+      const member = await ctx.telegram.getChatMember(chat.id, me.id);
+      const isAdmin = member.status === 'administrator' || member.status === 'creator';
+
+      if (!isAdmin) {
+        return ctx.answerCbQuery('Bot is not an admin there', { show_alert: true });
+      }
+
+      addBroadcastTarget(chat);
+      await ctx.answerCbQuery('Added to broadcast list');
+    } catch (e) {
+      return ctx.answerCbQuery(`Cannot access chat: ${e.message}`.slice(0, 190), { show_alert: true });
+    }
+  }
+
+  await showBroadcastSelector(ctx, true);
+});
+
+bot.action('bc_done', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  const count = loadBroadcastTargets().length;
+  await ctx.answerCbQuery(`Saved ${count} destination${count === 1 ? '' : 's'}`);
+  await showBroadcastSelector(ctx, true);
+});
+
+// ---------- Broadcast selector feature menu ----------
+bot.action('adm_broadcast_channels', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await showBroadcastSelector(ctx);
 });
 
 // ---------- Real owner-only commands (still work when typed; just not listed in the menu) ----------
@@ -459,23 +919,59 @@ function formatBroadcastInterval(ms) {
   if (ms % 60000 === 0) return `${ms / 60000}m`;
   return `${Math.round(ms / 1000)}s`;
 }
+async function sendPhotoWithRetry(chatId, imagePath, caption = '', maxAttempts = 3) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await bot.telegram.sendPhoto(
+        chatId,
+        { source: imagePath },
+        { caption: caption || undefined }
+      );
+      return { ok: true };
+    } catch (e) {
+      lastError = e;
+      console.error(
+        `sendPhoto attempt ${attempt}/${maxAttempts} failed for ${chatId}: ${e.message}`
+      );
+
+      if (attempt < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    error: lastError ? (lastError.message || String(lastError)) : 'Unknown error'
+  };
+}
+
 async function sendSavedImageToGroups() {
   const imagePath = getSavedAutoBroadcastImage();
   if (!imagePath) return { sent: 0, failed: 0, reason: 'no-image' };
+
   const groups = [...new Set(IMAGE_AUTO_BROADCAST.state.groupChats || [])];
   let sent = 0, failed = 0;
+
   for (const chatId of groups) {
-    try {
-      await bot.telegram.sendPhoto(chatId, { source: imagePath }, {
-        caption: IMAGE_AUTO_BROADCAST.state.caption || undefined
-      });
+    const result = await sendPhotoWithRetry(
+      chatId,
+      imagePath,
+      IMAGE_AUTO_BROADCAST.state.caption || ''
+    );
+
+    if (result.ok) {
       sent++;
-    } catch (e) {
+    } else {
       failed++;
-      console.error(`Image broadcast failed for ${chatId}: ${e.message}`);
+      console.error(`Image broadcast failed for ${chatId} after retries: ${result.error}`);
     }
-    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    await new Promise(resolve => setTimeout(resolve, 2500));
   }
+
   return { sent, failed };
 }
 function stopImageAutoBroadcast() {
@@ -511,7 +1007,7 @@ bot.use(async (ctx, next) => {
 bot.command('autostatus', async (ctx) => {
   if (!isOwner(ctx)) return;
   const img = getSavedAutoBroadcastImage();
-  await ctx.reply(`🖼️ Image auto-broadcast\nImage: ${img ? 'saved' : 'not set'}\nGroups tracked: ${(IMAGE_AUTO_BROADCAST.state.groupChats || []).length}\nStatus: ${IMAGE_AUTO_BROADCAST.state.enabled ? 'ON' : 'OFF'}\nInterval: ${formatBroadcastInterval(IMAGE_AUTO_BROADCAST.state.intervalMs)}`);
+  await ctx.reply(`🖼️ Image auto-broadcast\nImage: ${img ? 'saved' : 'not set'}\nSelected destinations: ${loadBroadcastTargets().length}\nTracked groups: ${(IMAGE_AUTO_BROADCAST.state.groupChats || []).length}\nStatus: ${IMAGE_AUTO_BROADCAST.state.enabled ? 'ON' : 'OFF'}\nInterval: ${formatBroadcastInterval(IMAGE_AUTO_BROADCAST.state.intervalMs)}\nUse /channels to choose destinations.`);
 });
 bot.command('sendimage', async (ctx) => {
   if (!isOwner(ctx)) return;
