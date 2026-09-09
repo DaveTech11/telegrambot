@@ -269,23 +269,39 @@ async function getAdminChannelsAndGroups() {
 }
 
 async function broadcast({ text, imagePath, targets } = {}) {
-  const chats = targets || selectedTargetIds();
+  const chats = [...new Set((targets || selectedTargetIds()).map(String))];
+  let sent = 0;
+  let failed = 0;
+  const failures = [];
+
   for (const chat of chats) {
     const admin = await isBotAdmin(chat);
     if (!admin) {
+      failed++;
+      failures.push(`${chat}: bot is not admin or chat is inaccessible`);
       console.log(`Skipping ${chat} - bot is not admin there.`);
       continue;
     }
+
     try {
       if (imagePath && fs.existsSync(imagePath)) {
-        await bot.telegram.sendPhoto(chat, { source: imagePath }, { caption: text || '' });
+        await sendPhotoWithRetry(chat, imagePath, text || '');
       } else if (text) {
         await bot.telegram.sendMessage(chat, text);
+      } else {
+        throw new Error('empty message');
       }
+      sent++;
     } catch (e) {
+      failed++;
+      failures.push(`${chat}: ${e.message}`);
       console.error(`Failed to send to ${chat}: ${e.message}`);
     }
+
+    await new Promise(resolve => setTimeout(resolve, 1500));
   }
+
+  return { sent, failed, failures, targets: chats };
 }
 
 function isOwner(ctx) {
@@ -872,6 +888,30 @@ bot.command('addchannel', async (ctx) => {
   }
 });
 
+
+bot.command('syncchannels', async (ctx) => {
+  if (!isOwner(ctx)) return;
+
+  const candidates = await getAdminChannelsAndGroups();
+  if (!candidates.length) {
+    return ctx.reply(
+      '❌ I could not discover any admin channels/groups yet.\\n\\n' +
+      'Use /addchannel @channelusername (or its -100... ID) once, then run /channels.'
+    );
+  }
+
+  const lines = candidates.map((x, i) =>
+    `${i + 1}. ${escapeHtml(x.title)} ${x.username ? '@' + escapeHtml(x.username) : ''} ` +
+    `${x.selected ? '✅ selected' : '☐ not selected'}`
+  );
+
+  await ctx.reply(
+    '<b>📡 XRYON CHANNEL SYNC</b>\\n\\n' + lines.join('\\n') +
+    '\\n\\nUse /channels to change selection.',
+    { parse_mode: 'HTML' }
+  );
+});
+
 // ---------- Channel/group selector for owner broadcasts ----------
 const broadcastSelectorKeyboard = async () => {
   const chats = await getAdminChannelsAndGroups();
@@ -978,10 +1018,29 @@ bot.action('adm_broadcast_channels', async (ctx) => {
 
 bot.command('send', async (ctx) => {
   if (!isOwner(ctx)) return;
-  const text = ctx.message.text.replace(/^\/send\s+/, '');
+  const text = ctx.message.text.replace(/^\/send\s+/, '').trim();
   if (!text) return ctx.reply('Usage: /send <message>');
-  await broadcast({ text });
-  await ctx.reply('Sent to all admin chats.');
+
+  const targets = selectedTargetIds();
+  if (!targets.length) {
+    return ctx.reply(
+      '❌ No destinations are selected.\n\n' +
+      'Use /channels → select your channel(s) → ✅ Done → then run /send again.'
+    );
+  }
+
+  const result = await broadcast({ text, targets });
+
+  let reply = `📨 <b>XRYON BROADCAST</b>\n\n` +
+    `📡 Targets: ${result.targets.length}\n` +
+    `✅ Sent: ${result.sent}\n` +
+    `❌ Failed: ${result.failed}`;
+
+  if (result.failures.length) {
+    reply += '\n\n<b>Failures</b>\n' + result.failures.slice(0, 10).map(escapeHtml).join('\n');
+  }
+
+  await ctx.reply(reply, { parse_mode: 'HTML' });
 });
 
 bot.command('status', async (ctx) => {
@@ -1135,15 +1194,22 @@ function formatBroadcastInterval(ms) {
   return `${Math.round(ms / 1000)}s`;
 }
 async function sendPhotoWithRetry(chatId, imagePath, caption = '', maxAttempts = 3) {
+  if (!imagePath || !fs.existsSync(imagePath)) {
+    return { ok: false, error: 'Image file does not exist on the server.' };
+  }
+
   let lastError;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      const photoStream = fs.createReadStream(imagePath);
+
       await bot.telegram.sendPhoto(
         chatId,
-        { source: imagePath },
+        { source: photoStream, filename: path.basename(imagePath) },
         { caption: caption || undefined }
       );
+
       return { ok: true };
     } catch (e) {
       lastError = e;
@@ -1163,14 +1229,24 @@ async function sendPhotoWithRetry(chatId, imagePath, caption = '', maxAttempts =
   };
 }
 
-async function sendSavedImageToGroups() {
+async function sendSavedImageToGroups(targets = null) {
   const imagePath = getSavedAutoBroadcastImage();
-  if (!imagePath) return { sent: 0, failed: 0, reason: 'no-image' };
+  if (!imagePath) return { sent: 0, failed: 0, reason: 'no-image', failures: [] };
 
-  const groups = [...new Set(IMAGE_AUTO_BROADCAST.state.groupChats || [])];
+  const groups = [...new Set((targets || selectedTargetIds()).map(String))];
+  if (!groups.length) return { sent: 0, failed: 0, reason: 'no-targets', failures: [] };
+
   let sent = 0, failed = 0;
+  const failures = [];
 
   for (const chatId of groups) {
+    const admin = await isBotAdmin(chatId);
+    if (!admin) {
+      failed++;
+      failures.push(`${chatId}: bot is not admin or chat is inaccessible`);
+      continue;
+    }
+
     const result = await sendPhotoWithRetry(
       chatId,
       imagePath,
@@ -1181,13 +1257,13 @@ async function sendSavedImageToGroups() {
       sent++;
     } else {
       failed++;
-      console.error(`Image broadcast failed for ${chatId} after retries: ${result.error}`);
+      failures.push(`${chatId}: ${result.error}`);
     }
 
     await new Promise(resolve => setTimeout(resolve, 2500));
   }
 
-  return { sent, failed };
+  return { sent, failed, failures, targets: groups };
 }
 function stopImageAutoBroadcast() {
   if (IMAGE_AUTO_BROADCAST.timer) clearInterval(IMAGE_AUTO_BROADCAST.timer);
@@ -1226,8 +1302,32 @@ bot.command('autostatus', async (ctx) => {
 });
 bot.command('sendimage', async (ctx) => {
   if (!isOwner(ctx)) return;
-  const result = await sendSavedImageToGroups();
-  await ctx.reply(result.reason === 'no-image' ? '❌ No image is saved. Send a photo to the bot first.' : `🖼️ Broadcast complete\n✅ Sent: ${result.sent}\n❌ Failed: ${result.failed}`);
+
+  const targets = selectedTargetIds();
+  if (!targets.length) {
+    return ctx.reply(
+      '❌ No broadcast destinations are selected.\n\n' +
+      'Use /channels, select your channels/groups, then press ✅ Done.'
+    );
+  }
+
+  const result = await sendSavedImageToGroups(targets);
+
+  if (result.reason === 'no-image') {
+    return ctx.reply('❌ No image is saved. Send a photo to the bot first.');
+  }
+
+  let message =
+    `<b>🖼️ XRYON IMAGE BROADCAST</b>\n\n` +
+    `📡 Targets: ${result.targets?.length || targets.length}\n` +
+    `✅ Sent: ${result.sent}\n` +
+    `❌ Failed: ${result.failed}`;
+
+  if (result.failures?.length) {
+    message += '\n\n<b>Failures</b>\n' + result.failures.slice(0, 10).map(escapeHtml).join('\n');
+  }
+
+  await ctx.reply(message, { parse_mode: 'HTML' });
 });
 bot.command('autosend', async (ctx) => {
   if (!isOwner(ctx)) return;
