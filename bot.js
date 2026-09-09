@@ -8,6 +8,26 @@ const config = require('./config');
 
 const bot = new Telegraf(config.BOT_TOKEN);
 
+// ---------- Bot identity from BOT_TOKEN ----------
+let BOT_INFO = null;
+
+async function loadBotInfo() {
+  try {
+    BOT_INFO = await bot.telegram.getMe();
+    return BOT_INFO;
+  } catch (error) {
+    console.error(`❌ Could not read bot identity: ${error.message}`);
+    return null;
+  }
+}
+
+function botIdentityText(info = BOT_INFO) {
+  if (!info) return '❌ Bot identity unavailable.';
+  const username = info.username ? `@${info.username}` : '(no username set)';
+  const name = [info.first_name, info.last_name].filter(Boolean).join(' ') || 'Unnamed';
+  return `🤖 Bot: ${name}\n👤 Username: ${username}\n🆔 ID: ${info.id}`;
+}
+
 // ---------- Color system ----------
 // Telegram Bot API does not provide arbitrary font-color styling. This
 // color system gives messages a consistent visual theme using color-coded
@@ -168,6 +188,7 @@ bot.action('pub_about', async (ctx) => {
 // visible when a non-owner sends it (no reply, no error) — it just looks like an unknown command.
 
 const adminKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback('🤖 Bot info', 'adm_bot_info')],
   [Markup.button.callback('📊 Status', 'adm_status')],
   [Markup.button.callback('📋 List Schedules', 'adm_schedules')],
   [Markup.button.callback('📨 Send now (how)', 'adm_send_help')],
@@ -179,6 +200,19 @@ const adminKeyboard = Markup.inlineKeyboard([
 bot.command('admin', async (ctx) => {
   if (!isOwner(ctx)) return; // silent — looks like the command doesn't exist
   await ctx.reply(`${themed('success', 'Admin panel unlocked.', { heading: true })}`, { parse_mode: 'HTML', ...adminKeyboard });
+});
+
+bot.action('adm_bot_info', async (ctx) => {
+  if (!isOwner(ctx)) return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  const info = await loadBotInfo();
+  await ctx.reply(botIdentityText(info));
+});
+
+bot.command('botinfo', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const info = await loadBotInfo();
+  await ctx.reply(botIdentityText(info));
 });
 
 bot.action('adm_status', async (ctx) => {
@@ -605,6 +639,15 @@ async function updateProfilePictureOnDeploy() {
 }
 
 async function main() {
+  const botInfo = await loadBotInfo();
+  if (botInfo && config.SHOW_BOT_INFO_ON_DEPLOY !== false) {
+    console.log('');
+    console.log('🤖 XRYON / Bot identity');
+    console.log(`   Name: ${[botInfo.first_name, botInfo.last_name].filter(Boolean).join(' ') || 'Unnamed'}`);
+    console.log(`   Username: ${botInfo.username ? '@' + botInfo.username : '(no username set)'}`);
+    console.log(`   ID: ${botInfo.id}`);
+    console.log('');
+  }
   setupSchedules();
   loadCustomSchedules();
   await setupCommandMenus();
