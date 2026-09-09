@@ -190,14 +190,59 @@ function removeBroadcastTarget(chatId) {
   saveBroadcastTargets(loadBroadcastTargets().filter(x => String(x.id) !== String(chatId)));
 }
 
+function upsertKnownDestination(chat) {
+  if (!chat || !chat.id) return;
+  const allowed = chat.type === 'channel' || chat.type === 'group' || chat.type === 'supergroup';
+  if (!allowed) return;
+
+  const list = loadBroadcastTargets();
+  const existing = list.find(x => String(x.id) === String(chat.id));
+
+  if (existing) {
+    existing.title = chat.title || chat.username || existing.title || String(chat.id);
+    existing.username = chat.username || existing.username || '';
+    existing.type = chat.type || existing.type || '';
+  } else {
+    list.push({
+      id: String(chat.id),
+      title: chat.title || chat.username || String(chat.id),
+      username: chat.username || '',
+      type: chat.type || ''
+    });
+  }
+
+  saveBroadcastTargets(list);
+}
+
+async function discoverAndTrackChat(chat) {
+  if (!chat || !chat.id) return false;
+
+  try {
+    const me = await bot.telegram.getMe();
+    const member = await bot.telegram.getChatMember(chat.id, me.id);
+    const isAdmin = member.status === 'administrator' || member.status === 'creator';
+
+    if (isAdmin && (chat.type === 'channel' || chat.type === 'group' || chat.type === 'supergroup')) {
+      upsertKnownDestination(chat);
+      return true;
+    }
+  } catch (e) {
+    console.warn(`Could not discover chat ${chat.id}: ${e.message}`);
+  }
+
+  return false;
+}
+
+
 async function getAdminChannelsAndGroups() {
   const configured = [...new Set([
     ...(config.TARGET_CHATS || []).map(String),
     ...loadBroadcastTargets().map(x => String(x.id))
   ])];
 
-  // Telegram Bot API does not provide a general "list every channel I'm admin in"
-  // endpoint. We can reliably verify known chats that have been configured/seen.
+  // The Bot API does not expose a general list-all-admin-chats endpoint.
+  // Xryon tracks chats from my_chat_member/channel_post/message updates and can
+  // also register a known channel explicitly with /addchannel.
   const results = [];
 
   for (const chatId of configured) {
@@ -252,33 +297,125 @@ function isOwner(ctx) {
 // so regular users never see the admin commands listed there at all.
 
 const publicKeyboard = Markup.inlineKeyboard([
-  [Markup.button.callback('ℹ️ Help', 'pub_help')],
-  [Markup.button.callback('📖 About', 'pub_about')],
+  [Markup.button.callback('ℹ️ Help', 'pub_help'), Markup.button.callback('📖 About', 'pub_about')],
+  [Markup.button.callback('👤 My Profile', 'pub_profile'), Markup.button.callback('📡 Channels', 'pub_channels')],
+  [Markup.button.callback('⚙️ Settings', 'pub_settings')],
 ]);
 
+function xryonWelcomeText() {
+  return [
+    '<b>✦ XRYON</b>',
+    '',
+    'Welcome 👋',
+    '',
+    'A simple Telegram utility for updates, media, channels and scheduled posts.',
+    '',
+    '<b>Quick access</b>',
+    'ℹ️ Help  •  📖 About',
+    '👤 Profile  •  📡 Channels',
+    '⚙️ Settings',
+    '',
+    'Use the buttons below to explore.'
+  ].join('\n');
+}
+
 bot.start(async (ctx) => {
-  await ctx.reply(
-    `${themed('primary', 'Welcome', { heading: true })}\n\n👋 Hi! I share periodic updates in this channel/group.\nUse the buttons below to learn more.`,
-    { ...publicKeyboard, parse_mode: 'HTML' }
-  );
+  await ctx.reply(xryonWelcomeText(), {
+    ...publicKeyboard,
+    parse_mode: 'HTML'
+  });
 });
 
 bot.command('help', async (ctx) => {
-  await ctx.reply(themed('info', 'This bot posts scheduled updates. Nothing to configure here — just sit back.'));
+  await ctx.reply(
+    [
+      '<b>ℹ️ XRYON HELP</b>',
+      '',
+      'Available commands:',
+      '/start — Open Xryon',
+      '/help — Show help',
+      '/about — About Xryon',
+      '/profile — View your profile',
+      '/channels — Owner broadcast destinations',
+      '/compose — Owner broadcast composer',
+      '',
+      'Owner-only tools are available only to authorized owners.'
+    ].join('\n'),
+    { parse_mode: 'HTML' }
+  );
 });
 
 bot.command('about', async (ctx) => {
-  await ctx.reply(`${themed('accent', 'About', { heading: true })}\n\n🤖 An automated update bot.`, { parse_mode: 'HTML' });
+  await ctx.reply(
+    [
+      '<b>📖 ABOUT XRYON</b>',
+      '',
+      'Xryon is a Telegram utility and broadcast assistant.',
+      '',
+      '• Channel/group posting',
+      '• Scheduled updates',
+      '• Media broadcasting',
+      '• Admin controls',
+      '• Owner-only management tools'
+    ].join('\n'),
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.command('profile', async (ctx) => {
+  const u = ctx.from;
+  const username = u.username ? `@${escapeHtml(u.username)}` : 'Not set';
+  await ctx.reply(
+    [
+      '<b>👤 YOUR XRYON PROFILE</b>',
+      '',
+      `<b>Name:</b> ${escapeHtml([u.first_name, u.last_name].filter(Boolean).join(' ') || 'Unknown')}`,
+      `<b>Username:</b> ${username}`,
+      `<b>Telegram ID:</b> <code>${u.id}</code>`
+    ].join('\n'),
+    { parse_mode: 'HTML' }
+  );
 });
 
 bot.action('pub_help', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply(themed('info', 'This bot posts scheduled updates. Nothing to configure here — just sit back.'));
+  await ctx.reply(
+    '<b>ℹ️ HELP</b>\n\nUse /start to open Xryon, /profile to view your profile, and /about to learn about the bot.',
+    { parse_mode: 'HTML' }
+  );
 });
 
 bot.action('pub_about', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply(`${themed('accent', 'About', { heading: true })}\n\n🤖 An automated update bot.`, { parse_mode: 'HTML' });
+  await ctx.reply(
+    '<b>📖 ABOUT</b>\n\nXryon is a Telegram utility and broadcast assistant.',
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.action('pub_profile', async (ctx) => {
+  await ctx.answerCbQuery();
+  const u = ctx.from;
+  await ctx.reply(
+    `<b>👤 PROFILE</b>\n\nName: ${escapeHtml([u.first_name, u.last_name].filter(Boolean).join(' ') || 'Unknown')}\nUsername: ${u.username ? '@' + escapeHtml(u.username) : 'Not set'}`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.action('pub_channels', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    '📡 Channel tools are available to authorized owners. Use /channels to manage selected broadcast destinations.',
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.action('pub_settings', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    '<b>⚙️ SETTINGS</b>\n\nPublic settings are limited. Owner controls are protected by authorization checks.',
+    { parse_mode: 'HTML' }
+  );
 });
 
 // ---------- Hidden admin panel — unlocked only via /admin, only for OWNER_IDS ----------
@@ -659,6 +796,82 @@ bot.command('broadcasts', async (ctx) => {
   await ctx.reply('<b>📊 RECENT BROADCASTS</b>\n\n' + lines.join('\n\n'), { parse_mode: 'HTML' });
 });
 
+
+// ---------- Automatic channel/group discovery ----------
+// Telegram sends a my_chat_member update when this bot is added, removed,
+// or promoted in a chat. Track newly discovered admin destinations automatically.
+bot.on('my_chat_member', async (ctx, next) => {
+  try {
+    const chat = ctx.myChatMember?.chat;
+    const newStatus = ctx.myChatMember?.new_chat_member?.status;
+
+    if (
+      chat &&
+      (chat.type === 'channel' || chat.type === 'group' || chat.type === 'supergroup') &&
+      (newStatus === 'administrator' || newStatus === 'creator')
+    ) {
+      upsertKnownDestination(chat);
+      console.log(`📡 Discovered admin destination: ${chat.title || chat.username || chat.id}`);
+    }
+  } catch (e) {
+    console.warn(`my_chat_member discovery failed: ${e.message}`);
+  }
+
+  return next();
+});
+
+// Also learn channel/group metadata from messages the bot actually receives there.
+bot.on('channel_post', async (ctx, next) => {
+  try {
+    await discoverAndTrackChat(ctx.chat);
+  } catch (e) {
+    console.warn(`channel_post discovery failed: ${e.message}`);
+  }
+  return next();
+});
+
+bot.on('message', async (ctx, next) => {
+  try {
+    if (
+      ctx.chat &&
+      (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup')
+    ) {
+      await discoverAndTrackChat(ctx.chat);
+    }
+  } catch (_) {}
+  return next();
+});
+
+// Manual registration is useful for channels that were added before the bot
+// started tracking membership updates.
+bot.command('addchannel', async (ctx) => {
+  if (!isOwner(ctx)) return;
+
+  const target = ctx.message.text.replace(/^\/addchannel\s*/i, '').trim();
+  if (!target) {
+    return ctx.reply('Usage: /addchannel @channelusername or /addchannel -1001234567890');
+  }
+
+  try {
+    const chat = await ctx.telegram.getChat(target);
+    const me = await ctx.telegram.getMe();
+    const member = await ctx.telegram.getChatMember(chat.id, me.id);
+    const isAdmin = member.status === 'administrator' || member.status === 'creator';
+
+    if (!isAdmin) {
+      return ctx.reply('❌ The bot is not an admin in that channel/group.');
+    }
+
+    upsertKnownDestination(chat);
+    await ctx.reply(
+      `✅ Added <b>${escapeHtml(chat.title || chat.username || String(chat.id))}</b> to the channel selector.`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (e) {
+    await ctx.reply(`❌ Could not add that channel/group: ${e.message}`);
+  }
+});
+
 // ---------- Channel/group selector for owner broadcasts ----------
 const broadcastSelectorKeyboard = async () => {
   const chats = await getAdminChannelsAndGroups();
@@ -681,7 +894,8 @@ async function showBroadcastSelector(ctx, edit = false) {
   const lines = [
     '<b>📡 Broadcast destinations</b>',
     '',
-    'Select the channels/groups where the bot is an admin.',
+    'Select channels/groups where the bot is an admin.',
+    'New admin channels are detected automatically. Use /addchannel if needed.',
     'Only selected destinations receive /send and /sendimage.',
     '',
     `Selected: <b>${selected.length}</b>`
@@ -867,9 +1081,10 @@ function setupSchedules() {
 async function setupCommandMenus() {
   await bot.telegram.setMyCommands(
     [
-      { command: 'start', description: 'Start the bot' },
-      { command: 'help', description: 'How this bot works' },
-      { command: 'about', description: 'About this bot' },
+      { command: 'start', description: 'Open Xryon' },
+      { command: 'help', description: 'Get help' },
+      { command: 'about', description: 'About Xryon' },
+      { command: 'profile', description: 'View your profile' },
     ],
     { scope: { type: 'default' } }
   );
