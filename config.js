@@ -14,7 +14,7 @@ module.exports = {
 
   // --- Every-2-minutes recurring post ---
   RECURRING_TEXT: 'Automated update',
-  RECURRING_IMAGE_PATH: './recurring.jpg', // set to null for text-only
+  RECURRING_IMAGE_PATH: './photo_2026-06-14_15-27-07.jpg', // set to null for text-only
 
   // --- Fixed daily times (24h "HH:MM") ---
   DAILY_TIMES: ['09:00', '18:30'],
