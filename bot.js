@@ -274,28 +274,30 @@ async function broadcast({ text, imagePath, targets } = {}) {
   let failed = 0;
   const failures = [];
 
-  for (const chat of chats) {
-    const admin = await isBotAdmin(chat);
+  if (!chats.length) return { sent: 0, failed: 0, failures: [], targets: [] , reason: 'no-targets' };
+
+  for (const chatId of chats) {
+    const admin = await isBotAdmin(chatId);
     if (!admin) {
       failed++;
-      failures.push(`${chat}: bot is not admin or chat is inaccessible`);
-      console.log(`Skipping ${chat} - bot is not admin there.`);
+      failures.push(`${chatId}: bot is not admin or chat is inaccessible`);
       continue;
     }
 
     try {
-      if (imagePath && fs.existsSync(imagePath)) {
-        await sendPhotoWithRetry(chat, imagePath, text || '');
+      if (imagePath) {
+        const photoResult = await sendPhotoWithRetry(chatId, imagePath, text || '');
+        if (!photoResult.ok) throw new Error(photoResult.error);
       } else if (text) {
-        await bot.telegram.sendMessage(chat, text);
+        await bot.telegram.sendMessage(chatId, text);
       } else {
         throw new Error('empty message');
       }
       sent++;
     } catch (e) {
       failed++;
-      failures.push(`${chat}: ${e.message}`);
-      console.error(`Failed to send to ${chat}: ${e.message}`);
+      failures.push(`${chatId}: ${e.message}`);
+      console.error(`Failed to send to ${chatId}: ${e.message}`);
     }
 
     await new Promise(resolve => setTimeout(resolve, 1500));
@@ -777,6 +779,7 @@ bot.on('photo', async (ctx, next) => {
   try {
     ensureImageAutoBroadcastStorage();
     const largest = ctx.message.photo[ctx.message.photo.length - 1];
+    IMAGE_AUTO_BROADCAST.state.fileId = largest.file_id;
     const link = await ctx.telegram.getFileLink(largest.file_id);
     const res = await fetch(link.href);
     if (!res.ok) throw new Error(`download failed: ${res.status}`);
@@ -1118,16 +1121,35 @@ bot.command('colors', async (ctx) => {
 // ---------- Fixed-config scheduling ----------
 
 function setupSchedules() {
-  // Recurring post every 2 minutes
-  cron.schedule('*/2 * * * *', () => {
-    broadcast({ text: config.RECURRING_TEXT, imagePath: config.RECURRING_IMAGE_PATH });
-  });
+  // Owner-selected recurring broadcast test loop: every 5 seconds.
+  // Only selected destinations receive the broadcast.
+  setInterval(async () => {
+    try {
+      const targets = selectedTargetIds();
+      if (!targets.length) return;
+      const image = getSavedAutoBroadcastImage();
+      const result = await broadcast({
+        text: config.RECURRING_TEXT,
+        imagePath: image,
+        targets
+      });
+      if (result.sent || result.failed) {
+        console.log(`⏱️ Recurring 5s broadcast: ✅ ${result.sent} / ❌ ${result.failed}`);
+      }
+    } catch (err) {
+      console.error(`❌ 5-second recurring broadcast failed: ${err.message}`);
+    }
+  }, 5000);
 
   // Fixed clock-time posts, e.g. config.DAILY_TIMES = ["09:00", "18:30"]
   for (const t of config.DAILY_TIMES) {
     const [hour, minute] = t.split(':').map(Number);
     cron.schedule(`${minute} ${hour} * * *`, () => {
-      broadcast({ text: config.DAILY_TEXT, imagePath: config.DAILY_IMAGE_PATH });
+      broadcast({
+        text: config.DAILY_TEXT,
+        imagePath: config.DAILY_IMAGE_PATH,
+        targets: selectedTargetIds()
+      }).catch((err) => console.error(`❌ Daily broadcast failed: ${err.message}`));
     });
   }
 }
@@ -1178,6 +1200,7 @@ function saveImageAutoBroadcastState() {
   fs.writeFileSync(IMAGE_AUTO_BROADCAST.filePath, JSON.stringify(IMAGE_AUTO_BROADCAST.state, null, 2));
 }
 function getSavedAutoBroadcastImage() {
+  if (IMAGE_AUTO_BROADCAST.state.fileId) return IMAGE_AUTO_BROADCAST.state.fileId;
   const p = IMAGE_AUTO_BROADCAST.state.imagePath;
   return p && fs.existsSync(p) ? p : null;
 }
@@ -1193,40 +1216,25 @@ function formatBroadcastInterval(ms) {
   if (ms % 60000 === 0) return `${ms / 60000}m`;
   return `${Math.round(ms / 1000)}s`;
 }
-async function sendPhotoWithRetry(chatId, imagePath, caption = '', maxAttempts = 3) {
-  if (!imagePath || !fs.existsSync(imagePath)) {
-    return { ok: false, error: 'Image file does not exist on the server.' };
-  }
-
-  let lastError;
+async function sendPhotoWithRetry(chatId, imageSource, caption = '', maxAttempts = 3) {
+  if (!imageSource) return { ok: false, error: 'No image source is configured.' };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const photoStream = fs.createReadStream(imagePath);
-
-      await bot.telegram.sendPhoto(
-        chatId,
-        { source: photoStream, filename: path.basename(imagePath) },
-        { caption: caption || undefined }
-      );
-
+      let source = imageSource;
+      if (typeof imageSource === 'string' && (imageSource.startsWith('/') || imageSource.includes('data/media/') || imageSource.includes('scheduled_images/'))) {
+        if (!fs.existsSync(imageSource)) throw new Error(`Local image file missing: ${imageSource}`);
+        source = { source: fs.createReadStream(imageSource), filename: path.basename(imageSource) };
+      }
+      await bot.telegram.sendPhoto(chatId, source, { caption: caption || undefined });
       return { ok: true };
     } catch (e) {
-      lastError = e;
-      console.error(
-        `sendPhoto attempt ${attempt}/${maxAttempts} failed for ${chatId}: ${e.message}`
-      );
-
-      if (attempt < maxAttempts) {
-        await new Promise(resolve => setTimeout(resolve, 3000 * attempt));
-      }
+      console.error(`sendPhoto attempt ${attempt}/${maxAttempts} failed for ${chatId}: ${e.message}`);
+      if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 3000 * attempt));
+      if (String(e.message).includes('400') || String(e.message).toLowerCase().includes('file is too big')) break;
     }
   }
-
-  return {
-    ok: false,
-    error: lastError ? (lastError.message || String(lastError)) : 'Unknown error'
-  };
+  return { ok: false, error: 'Photo upload/send failed after retries.' };
 }
 
 async function sendSavedImageToGroups(targets = null) {
@@ -1293,6 +1301,21 @@ bot.use(async (ctx, next) => {
     }
   } catch (_) {}
   return next();
+});
+
+bot.command('sendtest', async (ctx) => {
+  if (!isOwner(ctx)) return;
+  const targets = selectedTargetIds();
+  if (!targets.length) return ctx.reply('❌ No destinations selected. Use /channels first.');
+  const image = getSavedAutoBroadcastImage();
+  const result = await broadcast({
+    text: config.RECURRING_TEXT,
+    imagePath: image,
+    targets
+  });
+  let msg = `<b>🧪 XRYON TEST BROADCAST</b>\n\n📡 Targets: ${result.targets.length}\n✅ Sent: ${result.sent}\n❌ Failed: ${result.failed}`;
+  if (result.failures?.length) msg += '\n\n<b>Failures</b>\n' + result.failures.slice(0, 10).map(escapeHtml).join('\n');
+  await ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
 bot.command('autostatus', async (ctx) => {
@@ -1372,7 +1395,7 @@ bot.on('photo', async (ctx) => {
     IMAGE_AUTO_BROADCAST.state.imagePath = filePath;
     IMAGE_AUTO_BROADCAST.state.savedAt = new Date().toISOString();
     saveImageAutoBroadcastState();
-    await ctx.reply('✅ Image saved. Use /sendimage for a one-time broadcast or /autosend on 1h for scheduled sending.');
+    await ctx.reply('✅ Image saved. Xryon will use this image for the recurring broadcast and /sendimage.');
   } catch (e) {
     console.error('Could not save broadcast image:', e);
     await ctx.reply('❌ Could not save the image.');
@@ -1475,5 +1498,3 @@ main();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-
