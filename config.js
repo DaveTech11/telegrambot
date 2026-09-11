@@ -10,7 +10,7 @@ module.exports = {
   OWNER_IDS: [7724436551],
 
   // Group/channel IDs the bot should post to (usually negative numbers)
-  TARGET_CHATS: [-1003993519150],
+  TARGET_CHATS: [--1004319347732],
 
   // --- Every-2-minutes recurring post ---
   RECURRING_TEXT: 'Automated update',
