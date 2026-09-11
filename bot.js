@@ -1243,7 +1243,9 @@ async function sendPhotoWithRetry(chatId, imageSource, caption = '', maxAttempts
       let source = imageSource;
       if (typeof imageSource === 'string' && (imageSource.startsWith('/') || imageSource.includes('data/media/') || imageSource.includes('scheduled_images/'))) {
         if (!fs.existsSync(imageSource)) throw new Error(`Local image file missing: ${imageSource}`);
-        source = { source: fs.createReadStream(imageSource), filename: path.basename(imageSource) };
+        // Read fully into a Buffer instead of streaming — avoids undici/fetch
+        // "socket hang up" issues with streamed multipart bodies on newer Node.
+        source = { source: fs.readFileSync(imageSource), filename: path.basename(imageSource) };
       }
       await bot.telegram.sendPhoto(chatId, source, { caption: caption || undefined });
       return { ok: true };
