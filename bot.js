@@ -1,4 +1,3 @@
-
 const { Telegraf, Markup } = require('telegraf');
 const cron = require('node-cron');
 const fs = require('fs');
@@ -169,8 +168,12 @@ function targetIsSelected(chatId) {
   return loadBroadcastTargets().some(x => String(x.id) === String(chatId));
 }
 
+// Falls back to config.TARGET_CHATS when the owner hasn't picked anything
+// via /channels yet (or the ephemeral data/ store got wiped on redeploy).
 function selectedTargetIds() {
-  return loadBroadcastTargets().map(x => String(x.id));
+  const dynamic = loadBroadcastTargets().map(x => String(x.id));
+  if (dynamic.length) return dynamic;
+  return (config.TARGET_CHATS || []).map(String);
 }
 
 function addBroadcastTarget(chat) {
@@ -779,7 +782,6 @@ bot.on('photo', async (ctx, next) => {
   try {
     ensureImageAutoBroadcastStorage();
     const largest = ctx.message.photo[ctx.message.photo.length - 1];
-    IMAGE_AUTO_BROADCAST.state.fileId = largest.file_id;
     const link = await ctx.telegram.getFileLink(largest.file_id);
     const res = await fetch(link.href);
     if (!res.ok) throw new Error(`download failed: ${res.status}`);
@@ -1119,6 +1121,19 @@ bot.command('colors', async (ctx) => {
 });
 
 // ---------- Fixed-config scheduling ----------
+// Both loops below now fall back to config.js values (RECURRING_IMAGE_PATH /
+// TARGET_CHATS / DAILY_IMAGE_PATH) whenever the owner hasn't set anything
+// dynamically via /channels or by sending a photo directly to the bot.
+// Relative paths from config.js are resolved against this file's directory
+// so they work regardless of Render's working directory.
+
+function resolveConfiguredImage(relativeOrAbsolutePath) {
+  if (!relativeOrAbsolutePath) return null;
+  const resolved = path.isAbsolute(relativeOrAbsolutePath)
+    ? relativeOrAbsolutePath
+    : path.join(__dirname, relativeOrAbsolutePath);
+  return fs.existsSync(resolved) ? resolved : null;
+}
 
 function setupSchedules() {
   // Owner-selected recurring broadcast test loop: every 5 seconds.
@@ -1127,17 +1142,20 @@ function setupSchedules() {
     try {
       const targets = selectedTargetIds();
       if (!targets.length) return;
-      const image = getSavedAutoBroadcastImage();
+
+      const image = getSavedAutoBroadcastImage()
+        || resolveConfiguredImage(config.RECURRING_IMAGE_PATH);
+
       const result = await broadcast({
         text: config.RECURRING_TEXT,
         imagePath: image,
         targets
       });
       if (result.sent || result.failed) {
-        console.log(`⏱️ Recurring 5s broadcast: ✅ ${result.sent} / ❌ ${result.failed}`);
+        console.log(`⏱️ Recurring broadcast: ✅ ${result.sent} / ❌ ${result.failed}`);
       }
     } catch (err) {
-      console.error(`❌ 5-second recurring broadcast failed: ${err.message}`);
+      console.error(`❌ Recurring broadcast failed: ${err.message}`);
     }
   }, 5000);
 
@@ -1145,9 +1163,10 @@ function setupSchedules() {
   for (const t of config.DAILY_TIMES) {
     const [hour, minute] = t.split(':').map(Number);
     cron.schedule(`${minute} ${hour} * * *`, () => {
+      const image = resolveConfiguredImage(config.DAILY_IMAGE_PATH);
       broadcast({
         text: config.DAILY_TEXT,
-        imagePath: config.DAILY_IMAGE_PATH,
+        imagePath: image,
         targets: selectedTargetIds()
       }).catch((err) => console.error(`❌ Daily broadcast failed: ${err.message}`));
     });
@@ -1307,7 +1326,7 @@ bot.command('sendtest', async (ctx) => {
   if (!isOwner(ctx)) return;
   const targets = selectedTargetIds();
   if (!targets.length) return ctx.reply('❌ No destinations selected. Use /channels first.');
-  const image = getSavedAutoBroadcastImage();
+  const image = getSavedAutoBroadcastImage() || resolveConfiguredImage(config.RECURRING_IMAGE_PATH);
   const result = await broadcast({
     text: config.RECURRING_TEXT,
     imagePath: image,
@@ -1320,7 +1339,7 @@ bot.command('sendtest', async (ctx) => {
 
 bot.command('autostatus', async (ctx) => {
   if (!isOwner(ctx)) return;
-  const img = getSavedAutoBroadcastImage();
+  const img = getSavedAutoBroadcastImage() || resolveConfiguredImage(config.RECURRING_IMAGE_PATH);
   await ctx.reply(`🖼️ Image auto-broadcast\nImage: ${img ? 'saved' : 'not set'}\nSelected destinations: ${loadBroadcastTargets().length}\nTracked groups: ${(IMAGE_AUTO_BROADCAST.state.groupChats || []).length}\nStatus: ${IMAGE_AUTO_BROADCAST.state.enabled ? 'ON' : 'OFF'}\nInterval: ${formatBroadcastInterval(IMAGE_AUTO_BROADCAST.state.intervalMs)}\nUse /channels to choose destinations.`);
 });
 bot.command('sendimage', async (ctx) => {
