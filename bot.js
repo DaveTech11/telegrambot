@@ -612,7 +612,46 @@ bot.start(async ctx => {
     }
   );
 });
+bot.command('forwardimage', async (ctx) => {
+  if (!isOwner(ctx)) return;
 
+  const image = getRecurringImage();
+
+  if (!image) {
+    return ctx.reply(
+      `❌ Recurring image not found.\n\nConfigured path:\n${config.RECURRING_IMAGE_PATH}`
+    );
+  }
+
+  const target = ctx.message.text
+    .replace(/^\/forwardimage\s*/i, '')
+    .trim();
+
+  if (!target) {
+    return ctx.reply(
+      'Usage:\n/forwardimage @channelusername\n\nOr:\n/forwardimage -1001234567890'
+    );
+  }
+
+  try {
+    const result = await sendPhotoWithRetry(
+      target,
+      image,
+      config.RECURRING_TEXT || ''
+    );
+
+    if (!result.ok) {
+      return ctx.reply(`❌ Failed to send image.\n${result.error}`);
+    }
+
+    await ctx.reply(
+      `✅ Image sent successfully.\n\n🖼️ ${config.RECURRING_IMAGE_PATH}\n📡 Target: ${target}`
+    );
+  } catch (error) {
+    console.error('forwardimage error:', error);
+    await ctx.reply(`❌ Failed: ${error.message}`);
+  }
+});
 bot.command('help', async ctx => {
   await ctx.reply(
     [
